@@ -15,7 +15,7 @@ const pool = new Pool({
 });
 
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json());
 
 const authenticate = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
@@ -51,6 +51,8 @@ async function initDB() {
         rate DECIMAL(10,2) NOT NULL,
         route VARCHAR(20) NOT NULL DEFAULT 'east',
         min_weight DECIMAL(10,2) DEFAULT 10,
+        congestion_zone BOOLEAN DEFAULT false,
+        congestion_rate DECIMAL(10,2) DEFAULT 5.00,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
       CREATE TABLE IF NOT EXISTS extras (
@@ -100,36 +102,27 @@ async function initDB() {
         UNIQUE(cleaner_id, week_start)
       );
     `);
-    
+
+    // Add congestion columns if they don't exist (for existing databases)
+    await client.query(`
+      ALTER TABLE cleaners ADD COLUMN IF NOT EXISTS congestion_zone BOOLEAN DEFAULT false;
+      ALTER TABLE cleaners ADD COLUMN IF NOT EXISTS congestion_rate DECIMAL(10,2) DEFAULT 5.00;
+    `);
+
     const userCheck = await client.query('SELECT COUNT(*) FROM users');
     if (parseInt(userCheck.rows[0].count) === 0) {
       const adminHash = await bcrypt.hash('admin123', 10);
       const attendantHash = await bcrypt.hash('webster123', 10);
       await client.query('INSERT INTO users (username, password, role) VALUES ($1, $2, $3), ($4, $5, $6)',
-        ['admin', adminHash, 'admin', 'webstaff', attendantHash, 'attendant']);
-    }
-    
-    const settingsCheck = await client.query('SELECT COUNT(*) FROM settings');
-    if (parseInt(settingsCheck.rows[0].count) === 0) {
-      await client.query(`INSERT INTO settings (key, value) VALUES ('sameDayMult', '1.0'), ('defaultRate', '0.85'), ('autoClearDays', '90')`);
-    }
-    
-    const extrasCheck = await client.query('SELECT COUNT(*) FROM extras');
-    if (parseInt(extrasCheck.rows[0].count) === 0) {
-      await client.query(`
-        INSERT INTO extras (name, price, category) VALUES 
-        ('Blanket - SM', 8.00, 'Blanket'), ('Blanket - MED', 12.00, 'Blanket'), ('Blanket - LG', 15.00, 'Blanket'),
-        ('Comforter - SM', 15.00, 'Comforter'), ('Comforter - MED', 20.00, 'Comforter'), ('Comforter - LG', 25.00, 'Comforter'),
-        ('Rug - SM', 15.00, 'Rug'), ('Rug - MED', 25.00, 'Rug'), ('Rug - LG', 40.00, 'Rug'),
-        ('Carpet - MED', 35.00, 'Carpet'), ('Carpet - LG', 50.00, 'Carpet'),
-        ('Mat - SM', 10.00, 'Mat'), ('Mat - MED', 15.00, 'Mat'), ('Mat - LG', 20.00, 'Mat')
-      `);
+        ['admin', adminHash, 'admin', 'webster', attendantHash, 'attendant']);
     }
 
-    try { await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS staff_name VARCHAR(50)`); } catch(e) {}
-    try { await client.query(`ALTER TABLE cleaners ADD COLUMN IF NOT EXISTS min_weight DECIMAL(10,2) DEFAULT 10`); } catch(e) {}
-    try { await client.query(`ALTER TABLE extras ADD COLUMN IF NOT EXISTS category VARCHAR(50) DEFAULT 'Other'`); } catch(e) {}
-    
+    const settingsCheck = await client.query('SELECT COUNT(*) FROM settings');
+    if (parseInt(settingsCheck.rows[0].count) === 0) {
+      await client.query('INSERT INTO settings (key, value) VALUES ($1, $2), ($3, $4)',
+        ['sameDayMult', '1.0', 'defaultRate', '0.65']);
+    }
+
     console.log('Database initialized');
   } catch (err) {
     console.error('DB init error:', err);
@@ -138,189 +131,63 @@ async function initDB() {
   }
 }
 
-// Auto-clear old orders (runs daily)
-async function autoClearOldOrders() {
-  try {
-    const settingsResult = await pool.query("SELECT value FROM settings WHERE key = 'autoClearDays'");
-    const days = settingsResult.rows.length > 0 ? parseInt(settingsResult.rows[0].value) : 90;
-    if (days > 0) {
-      const result = await pool.query(`DELETE FROM orders WHERE pickup_date < CURRENT_DATE - INTERVAL '1 day' * $1`, [days]);
-      console.log(`Auto-cleared ${result.rowCount} orders older than ${days} days`);
-    }
-  } catch (err) {
-    console.error('Auto-clear error:', err.message);
-  }
-}
-
-setInterval(autoClearOldOrders, 24 * 60 * 60 * 1000);
-
-// ============ AUTH ============
+// Auth routes
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
   try {
-    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username.toLowerCase()]);
     if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
     const user = result.rows[0];
-    if (!await bcrypt.compare(password, user.password)) return res.status(401).json({ error: 'Invalid credentials' });
-    const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+    const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
   } catch (err) {
+    console.error('Login error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
 app.get('/api/me', authenticate, (req, res) => {
-  res.json({ user: { id: req.user.id, username: req.user.username, role: req.user.role } });
+  res.json({ user: req.user });
 });
 
-// ============ ORDERS - SPECIFIC ROUTES FIRST (before /:id) ============
-
-app.delete('/api/orders/clear-all', authenticate, adminOnly, async (req, res) => {
-  console.log('=== CLEAR ALL ORDERS ===');
-  try {
-    const countResult = await pool.query('SELECT COUNT(*) FROM orders');
-    const count = parseInt(countResult.rows[0].count);
-    console.log('Orders to delete:', count);
-    await pool.query('DELETE FROM orders');
-    console.log('Deleted successfully');
-    res.json({ success: true, deleted: count });
-  } catch (err) {
-    console.error('CLEAR ERROR:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/orders/check-duplicate', authenticate, async (req, res) => {
-  const { order_num, cleaner_id, exclude_id } = req.query;
-  try {
-    let query = 'SELECT id, order_num, pickup_date, cleaner_id FROM orders WHERE order_num = $1';
-    let params = [order_num];
-    if (cleaner_id) { query += ' AND cleaner_id = $2'; params.push(cleaner_id); }
-    if (exclude_id) { query += ` AND id != $${params.length + 1}`; params.push(exclude_id); }
-    const result = await pool.query(query, params);
-    res.json(result.rows.length > 0 ? { isDuplicate: true, existingOrder: result.rows[0] } : { isDuplicate: false });
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.get('/api/orders/check-sequence', authenticate, async (req, res) => {
-  const { order_num, cleaner_id } = req.query;
-  try {
-    // Get the last few orders for this cleaner to find the highest order number
-    const result = await pool.query(
-      `SELECT order_num FROM orders WHERE cleaner_id = $1 ORDER BY created_at DESC LIMIT 10`,
-      [cleaner_id]
-    );
-    if (result.rows.length === 0) return res.json({ isOutOfSequence: false });
-    
-    // Find the highest numeric order number from recent orders
-    let lastNum = 0;
-    let lastOrderNum = '';
-    for (const row of result.rows) {
-      const num = parseInt(row.order_num) || 0;
-      if (num > lastNum) {
-        lastNum = num;
-        lastOrderNum = row.order_num;
-      }
-    }
-    
-    const currNum = parseInt(order_num) || 0;
-    const diff = Math.abs(currNum - lastNum);
-    
-    // Flag if difference is 50 or more (either direction)
-    const isOutOfSequence = diff >= 50;
-    res.json(isOutOfSequence ? { isOutOfSequence: true, lastOrderNum, difference: diff } : { isOutOfSequence: false });
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.get('/api/orders/find-duplicates', authenticate, adminOnly, async (req, res) => {
-  const { cleaner_id, start_date, end_date } = req.query;
-  try {
-    let query = `SELECT order_num, COUNT(*) as count FROM orders WHERE pickup_date >= $1 AND pickup_date <= $2`;
-    let params = [start_date, end_date];
-    if (cleaner_id) { query += ' AND cleaner_id = $3'; params.push(cleaner_id); }
-    query += ' GROUP BY order_num HAVING COUNT(*) > 1';
-    const result = await pool.query(query, params);
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.post('/api/orders/import', authenticate, adminOnly, async (req, res) => {
-  const { orders } = req.body;
-  if (!orders || !Array.isArray(orders)) return res.status(400).json({ error: 'orders array required' });
-  let imported = 0, skipped = 0;
-  for (const order of orders) {
-    try {
-      if (!order.order_num || !order.cleaner_id || !order.weight) { skipped++; continue; }
-      await pool.query(
-        `INSERT INTO orders (order_num, cleaner_id, weight, service_type, pickup_date, bag_color, extras, notes, staff_name) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-        [order.order_num, order.cleaner_id, order.weight, order.service_type || '24-hour', order.pickup_date || new Date().toISOString().split('T')[0], order.bag_color || 'White', order.extras || [], order.notes || '', order.staff_name || '']
-      );
-      imported++;
-    } catch (e) { skipped++; }
-  }
-  res.json({ imported, skipped });
-});
-
-app.get('/api/orders/export', authenticate, adminOnly, async (req, res) => {
-  try {
-    const ordersResult = await pool.query(`
-      SELECT o.*, c.name as cleaner_name, c.rate as cleaner_rate, c.route, c.min_weight
-      FROM orders o JOIN cleaners c ON o.cleaner_id = c.id ORDER BY o.pickup_date DESC
-    `);
-    const extrasResult = await pool.query('SELECT * FROM extras');
-    const extrasMap = {}; extrasResult.rows.forEach(e => { extrasMap[e.id] = e; });
-    const settingsResult = await pool.query('SELECT * FROM settings');
-    const settings = {}; settingsResult.rows.forEach(r => { settings[r.key] = parseFloat(r.value); });
-
-    const orders = ordersResult.rows.map(o => {
-      const rate = parseFloat(o.cleaner_rate);
-      const weight = parseFloat(o.weight);
-      const minWeight = parseFloat(o.min_weight) || 10;
-      const mult = o.service_type === 'same-day' ? (settings.sameDayMult || 1) : 1;
-      const billableWeight = weight === 0 ? 0 : Math.max(weight, minWeight);
-      const baseTotal = billableWeight * rate * mult;
-      const extrasTotal = (o.extras || []).reduce((sum, id) => sum + parseFloat(extrasMap[id]?.price || 0), 0);
-      const extrasNames = (o.extras || []).map(id => extrasMap[id]?.name || '').filter(n => n).join(', ');
-      return {
-        order_num: o.order_num, cleaner_name: o.cleaner_name, route: o.route, weight: o.weight,
-        rate_per_lb: rate, service_type: o.service_type, pickup_date: o.pickup_date, bag_color: o.bag_color,
-        extras: extrasNames, extras_total: extrasTotal, total: baseTotal + extrasTotal, notes: o.notes || '', staff_name: o.staff_name || ''
-      };
-    });
-    res.json({ orders, settings });
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// ============ ORDERS - GENERIC ROUTES ============
+// Orders routes
 app.get('/api/orders', authenticate, async (req, res) => {
   try {
-    const { search, limit } = req.query;
-    let query = 'SELECT * FROM orders';
-    let params = [];
-    
+    const { cleaner_id, start_date, end_date, limit = 500, search } = req.query;
+    let query = 'SELECT o.* FROM orders o';
+    const params = [];
+    const conditions = [];
+
     if (search) {
-      query += ' WHERE order_num ILIKE $1';
-      params.push('%' + search + '%');
+      query = `SELECT o.* FROM orders o LEFT JOIN cleaners c ON o.cleaner_id = c.id`;
+      params.push('%' + search + '%', '%' + search + '%');
+      conditions.push(`(o.order_num ILIKE $${params.length-1} OR c.name ILIKE $${params.length})`);
     }
-    
-    query += ' ORDER BY created_at DESC';
-    
-    if (limit) {
-      query += ' LIMIT $' + (params.length + 1);
-      params.push(parseInt(limit));
+
+    if (cleaner_id) {
+      params.push(cleaner_id);
+      conditions.push(`o.cleaner_id = $${params.length}`);
     }
-    
+    if (start_date) {
+      params.push(start_date);
+      conditions.push(`o.pickup_date >= $${params.length}`);
+    }
+    if (end_date) {
+      params.push(end_date);
+      conditions.push(`o.pickup_date <= $${params.length}`);
+    }
+
+    if (conditions.length > 0) query += ' WHERE ' + conditions.join(' AND ');
+    query += ' ORDER BY o.pickup_date DESC, o.created_at DESC';
+    params.push(limit);
+    query += ` LIMIT $${params.length}`;
+
     const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (err) {
+    console.error('Get orders error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -331,12 +198,28 @@ app.post('/api/orders', authenticate, async (req, res) => {
     const result = await pool.query(
       `INSERT INTO orders (order_num, cleaner_id, weight, service_type, pickup_date, bag_color, extras, notes, staff_name) 
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-      [order_num, cleaner_id, weight, service_type || '24-hour', pickup_date, bag_color || 'White', extras || [], notes || '', staff_name || '']
+      [order_num, cleaner_id, weight || 0, service_type || '24-hour', pickup_date, bag_color || 'White', extras || [], notes, staff_name]
     );
     res.json(result.rows[0]);
   } catch (err) {
+    console.error('Create order error:', err);
     res.status(500).json({ error: 'Server error' });
   }
+});
+
+app.post('/api/orders/import', authenticate, async (req, res) => {
+  const { orders } = req.body;
+  let imported = 0, skipped = 0;
+  for (const o of orders) {
+    try {
+      await pool.query(
+        `INSERT INTO orders (order_num, cleaner_id, weight, service_type, pickup_date, bag_color, extras, notes, staff_name) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [o.order_num, o.cleaner_id, o.weight, o.service_type, o.pickup_date, o.bag_color || 'White', o.extras || [], o.notes || '', o.staff_name || '']
+      );
+      imported++;
+    } catch (e) { skipped++; }
+  }
+  res.json({ imported, skipped });
 });
 
 app.put('/api/orders/:id', authenticate, async (req, res) => {
@@ -345,11 +228,12 @@ app.put('/api/orders/:id', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
       `UPDATE orders SET order_num=$1, cleaner_id=$2, weight=$3, service_type=$4, pickup_date=$5, bag_color=$6, extras=$7, notes=$8, staff_name=$9, updated_at=CURRENT_TIMESTAMP WHERE id=$10 RETURNING *`,
-      [order_num, cleaner_id, weight, service_type, pickup_date, bag_color, extras || [], notes || '', staff_name || '', id]
+      [order_num, cleaner_id, weight, service_type, pickup_date, bag_color, extras || [], notes, staff_name, id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
     res.json(result.rows[0]);
   } catch (err) {
+    console.error('Update order error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -364,7 +248,51 @@ app.delete('/api/orders/:id', authenticate, async (req, res) => {
   }
 });
 
-// ============ CLEANERS ============
+app.delete('/api/orders/clear-all', authenticate, adminOnly, async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM orders');
+    res.json({ deleted: result.rowCount });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/orders/export', authenticate, adminOnly, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT o.*, c.name as cleaner_name, c.rate as rate_per_lb, c.route 
+      FROM orders o LEFT JOIN cleaners c ON o.cleaner_id = c.id 
+      ORDER BY o.pickup_date DESC, o.created_at DESC
+    `);
+    const extrasResult = await pool.query('SELECT * FROM extras');
+    const extrasMap = {};
+    extrasResult.rows.forEach(e => { extrasMap[e.id] = e; });
+    const orders = result.rows.map(o => {
+      const extrasTotal = (o.extras || []).reduce((sum, id) => sum + parseFloat(extrasMap[id]?.price || 0), 0);
+      const base = parseFloat(o.weight) * parseFloat(o.rate_per_lb || 0);
+      return { ...o, extras: (o.extras || []).map(id => extrasMap[id]?.name).join(', '), extras_total: extrasTotal, total: base + extrasTotal };
+    });
+    res.json({ orders });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/orders/find-duplicates', authenticate, async (req, res) => {
+  const { cleaner_id, start_date, end_date } = req.query;
+  try {
+    const result = await pool.query(`
+      SELECT order_num, COUNT(*) as count FROM orders 
+      WHERE cleaner_id = $1 AND pickup_date >= $2 AND pickup_date <= $3 
+      GROUP BY order_num HAVING COUNT(*) > 1
+    `, [cleaner_id, start_date, end_date]);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Cleaners routes
 app.get('/api/cleaners', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM cleaners ORDER BY name');
@@ -375,11 +303,11 @@ app.get('/api/cleaners', authenticate, async (req, res) => {
 });
 
 app.post('/api/cleaners', authenticate, adminOnly, async (req, res) => {
-  const { name, address, rate, route, min_weight } = req.body;
+  const { name, address, rate, route, min_weight, congestion_zone, congestion_rate } = req.body;
   try {
     const result = await pool.query(
-      'INSERT INTO cleaners (name, address, rate, route, min_weight) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [name, address, rate, route || 'east', min_weight || 10]
+      'INSERT INTO cleaners (name, address, rate, route, min_weight, congestion_zone, congestion_rate) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [name, address, rate, route || 'east', min_weight || 10, congestion_zone || false, congestion_rate || 5.00]
     );
     res.json(result.rows[0]);
   } catch (err) {
@@ -388,11 +316,12 @@ app.post('/api/cleaners', authenticate, adminOnly, async (req, res) => {
 });
 
 app.put('/api/cleaners/:id', authenticate, adminOnly, async (req, res) => {
-  const { name, address, rate, route, min_weight } = req.body;
+  const { id } = req.params;
+  const { name, address, rate, route, min_weight, congestion_zone, congestion_rate } = req.body;
   try {
     const result = await pool.query(
-      'UPDATE cleaners SET name=$1, address=$2, rate=$3, route=$4, min_weight=$5 WHERE id=$6 RETURNING *',
-      [name, address, rate, route, min_weight || 10, req.params.id]
+      'UPDATE cleaners SET name=$1, address=$2, rate=$3, route=$4, min_weight=$5, congestion_zone=$6, congestion_rate=$7 WHERE id=$8 RETURNING *',
+      [name, address, rate, route, min_weight, congestion_zone || false, congestion_rate || 5.00, id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Cleaner not found' });
     res.json(result.rows[0]);
@@ -404,31 +333,30 @@ app.put('/api/cleaners/:id', authenticate, adminOnly, async (req, res) => {
 app.delete('/api/cleaners/:id', authenticate, adminOnly, async (req, res) => {
   try {
     const orderCheck = await pool.query('SELECT COUNT(*) FROM orders WHERE cleaner_id = $1', [req.params.id]);
-    if (parseInt(orderCheck.rows[0].count) > 0) return res.status(400).json({ error: 'Cannot delete cleaner with orders' });
-    const result = await pool.query('DELETE FROM cleaners WHERE id = $1 RETURNING *', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Cleaner not found' });
+    if (parseInt(orderCheck.rows[0].count) > 0) return res.status(400).json({ error: 'Cannot delete cleaner with existing orders' });
+    await pool.query('DELETE FROM cleaners WHERE id = $1', [req.params.id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-app.get('/api/cleaners/:id/extras', authenticate, async (req, res) => {
+// Cleaner extras routes
+app.get('/api/cleaner-extras', authenticate, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM cleaner_extras WHERE cleaner_id = $1', [req.params.id]);
+    const result = await pool.query('SELECT * FROM cleaner_extras');
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-app.post('/api/cleaners/:id/extras', authenticate, adminOnly, async (req, res) => {
-  const { extra_id, custom_price } = req.body;
+app.post('/api/cleaner-extras', authenticate, adminOnly, async (req, res) => {
+  const { cleaner_id, extra_id, custom_price } = req.body;
   try {
     const result = await pool.query(
-      `INSERT INTO cleaner_extras (cleaner_id, extra_id, custom_price) VALUES ($1, $2, $3)
-       ON CONFLICT (cleaner_id, extra_id) DO UPDATE SET custom_price = $3 RETURNING *`,
-      [req.params.id, extra_id, custom_price]
+      'INSERT INTO cleaner_extras (cleaner_id, extra_id, custom_price) VALUES ($1, $2, $3) ON CONFLICT (cleaner_id, extra_id) DO UPDATE SET custom_price = $3 RETURNING *',
+      [cleaner_id, extra_id, custom_price]
     );
     res.json(result.rows[0]);
   } catch (err) {
@@ -436,16 +364,16 @@ app.post('/api/cleaners/:id/extras', authenticate, adminOnly, async (req, res) =
   }
 });
 
-app.delete('/api/cleaners/:id/extras/:extraId', authenticate, adminOnly, async (req, res) => {
+app.delete('/api/cleaner-extras/:cleaner_id/:extra_id', authenticate, adminOnly, async (req, res) => {
   try {
-    await pool.query('DELETE FROM cleaner_extras WHERE cleaner_id = $1 AND extra_id = $2', [req.params.id, req.params.extraId]);
+    await pool.query('DELETE FROM cleaner_extras WHERE cleaner_id = $1 AND extra_id = $2', [req.params.cleaner_id, req.params.extra_id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// ============ EXTRAS ============
+// Extras routes
 app.get('/api/extras', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM extras ORDER BY category, name');
@@ -468,7 +396,7 @@ app.post('/api/extras', authenticate, adminOnly, async (req, res) => {
 app.put('/api/extras/:id', authenticate, adminOnly, async (req, res) => {
   const { name, price, category } = req.body;
   try {
-    const result = await pool.query('UPDATE extras SET name=$1, price=$2, category=$3 WHERE id=$4 RETURNING *', [name, price, category || 'Other', req.params.id]);
+    const result = await pool.query('UPDATE extras SET name=$1, price=$2, category=$3 WHERE id=$4 RETURNING *', [name, price, category, req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Extra not found' });
     res.json(result.rows[0]);
   } catch (err) {
@@ -478,19 +406,19 @@ app.put('/api/extras/:id', authenticate, adminOnly, async (req, res) => {
 
 app.delete('/api/extras/:id', authenticate, adminOnly, async (req, res) => {
   try {
-    const result = await pool.query('DELETE FROM extras WHERE id = $1 RETURNING *', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Extra not found' });
+    await pool.query('DELETE FROM extras WHERE id = $1', [req.params.id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// ============ SETTINGS ============
+// Settings routes
 app.get('/api/settings', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM settings');
-    const settings = {}; result.rows.forEach(r => { settings[r.key] = r.value; });
+    const settings = {};
+    result.rows.forEach(row => { settings[row.key] = parseFloat(row.value); });
     res.json(settings);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -498,237 +426,226 @@ app.get('/api/settings', authenticate, async (req, res) => {
 });
 
 app.put('/api/settings', authenticate, adminOnly, async (req, res) => {
-  const { sameDayMult, defaultRate, autoClearDays } = req.body;
+  const { sameDayMult, defaultRate } = req.body;
   try {
-    if (sameDayMult !== undefined) await pool.query("INSERT INTO settings (key, value) VALUES ('sameDayMult', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [sameDayMult.toString()]);
-    if (defaultRate !== undefined) await pool.query("INSERT INTO settings (key, value) VALUES ('defaultRate', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [defaultRate.toString()]);
-    if (autoClearDays !== undefined) await pool.query("INSERT INTO settings (key, value) VALUES ('autoClearDays', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [autoClearDays.toString()]);
-    res.json({ success: true });
+    await pool.query('UPDATE settings SET value = $1 WHERE key = $2', [sameDayMult.toString(), 'sameDayMult']);
+    await pool.query('UPDATE settings SET value = $1 WHERE key = $2', [defaultRate.toString(), 'defaultRate']);
+    res.json({ sameDayMult, defaultRate });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// ============ REPORTS ============
+// Reports routes
 app.get('/api/reports/invoice', authenticate, adminOnly, async (req, res) => {
   const { cleaner_id, start_date, end_date } = req.query;
-  if (!cleaner_id || !start_date || !end_date) return res.status(400).json({ error: 'Missing params' });
-  
+  if (!cleaner_id || !start_date || !end_date) return res.status(400).json({ error: 'cleaner_id, start_date, and end_date required' });
+
   try {
     const cleanerResult = await pool.query('SELECT * FROM cleaners WHERE id = $1', [cleaner_id]);
-    if (cleanerResult.rows.length === 0) return res.status(404).json({ error: 'Cleaner not found' });
     const cleaner = cleanerResult.rows[0];
     
     const ordersResult = await pool.query(
-      `SELECT o.*, c.rate as cleaner_rate, c.min_weight FROM orders o JOIN cleaners c ON o.cleaner_id = c.id
+      `SELECT o.*, c.name as cleaner_name, c.rate as cleaner_rate, c.min_weight, c.congestion_zone, c.congestion_rate
+       FROM orders o JOIN cleaners c ON o.cleaner_id = c.id 
        WHERE o.cleaner_id = $1 AND o.pickup_date >= $2 AND o.pickup_date <= $3 ORDER BY o.pickup_date, o.order_num`,
       [cleaner_id, start_date, end_date]
     );
-    
-    const extrasResult = await pool.query('SELECT * FROM extras');
-    const extrasMap = {}; extrasResult.rows.forEach(e => { extrasMap[e.id] = e; });
-    
-    const cleanerExtrasResult = await pool.query('SELECT * FROM cleaner_extras WHERE cleaner_id = $1', [cleaner_id]);
-    const customPrices = {}; cleanerExtrasResult.rows.forEach(ce => { customPrices[ce.extra_id] = parseFloat(ce.custom_price); });
-    
-    const settingsResult = await pool.query('SELECT * FROM settings');
-    const settings = {}; settingsResult.rows.forEach(r => { settings[r.key] = parseFloat(r.value); });
 
-    // Check for sequence gaps
+    const extrasResult = await pool.query('SELECT * FROM extras');
+    const extrasMap = {};
+    extrasResult.rows.forEach(e => { extrasMap[e.id] = e; });
+
+    const cleanerExtrasResult = await pool.query('SELECT * FROM cleaner_extras WHERE cleaner_id = $1', [cleaner_id]);
+    const cleanerExtrasMap = {};
+    cleanerExtrasResult.rows.forEach(ce => { cleanerExtrasMap[ce.extra_id] = parseFloat(ce.custom_price); });
+
+    const settingsResult = await pool.query('SELECT * FROM settings');
+    const settings = {};
+    settingsResult.rows.forEach(row => { settings[row.key] = parseFloat(row.value); });
+
+    // Track unique pickup dates for congestion calculation
+    const uniquePickupDates = new Set();
+
+    // Sequence gap detection
+    const orderNums = ordersResult.rows.map(o => parseInt(o.order_num.replace(/\D/g, ''))).filter(n => !isNaN(n)).sort((a, b) => a - b);
     const sequenceWarnings = [];
-    const sortedByNum = [...ordersResult.rows].sort((a, b) => (parseInt(a.order_num) || 0) - (parseInt(b.order_num) || 0));
-    for (let i = 1; i < sortedByNum.length; i++) {
-      const prevNum = parseInt(sortedByNum[i-1].order_num) || 0;
-      const currNum = parseInt(sortedByNum[i].order_num) || 0;
-      const diff = currNum - prevNum;
-      if (diff >= 50 || diff <= -50) {
-        sequenceWarnings.push({ from: sortedByNum[i-1].order_num, to: sortedByNum[i].order_num, gap: diff });
+    for (let i = 1; i < orderNums.length; i++) {
+      const gap = orderNums[i] - orderNums[i - 1];
+      if (gap > 50 || gap < 0) {
+        sequenceWarnings.push({ from: orderNums[i - 1], to: orderNums[i], gap });
       }
     }
 
     const orders = ordersResult.rows.map(o => {
-      const rate = parseFloat(o.cleaner_rate);
-      const weight = parseFloat(o.weight);
       const minWeight = parseFloat(o.min_weight) || 10;
-      const mult = o.service_type === 'same-day' ? (settings.sameDayMult || 1) : 1;
-      const billableWeight = weight === 0 ? 0 : Math.max(weight, minWeight);
-      const baseTotal = billableWeight * rate * mult;
-      
-      const extrasCounts = {};
-      let extrasTotal = 0;
-      (o.extras || []).forEach(id => {
+      const billedWeight = Math.max(parseFloat(o.weight), parseFloat(o.weight) > 0 ? minWeight : 0);
+      const rate = parseFloat(o.cleaner_rate);
+      const mult = o.service_type === 'same-day' ? settings.sameDayMult : 1;
+      const base = billedWeight * rate * mult;
+
+      const extrasTotal = (o.extras || []).reduce((sum, id) => {
+        const customPrice = cleanerExtrasMap[id];
+        const defaultPrice = extrasMap[id]?.price || 0;
+        return sum + (customPrice !== undefined ? customPrice : parseFloat(defaultPrice));
+      }, 0);
+
+      const extrasFormatted = (o.extras || []).map(id => {
         const ex = extrasMap[id];
-        if (ex) {
-          const price = customPrices[id] !== undefined ? customPrices[id] : parseFloat(ex.price);
-          extrasTotal += price;
-          extrasCounts[ex.name] = (extrasCounts[ex.name] || 0) + 1;
-        }
-      });
-      const extrasFormatted = Object.entries(extrasCounts).map(([n, c]) => c > 1 ? `${c}x ${n}` : n).join(', ');
-      
-      return { ...o, total: baseTotal + extrasTotal, extras_formatted: extrasFormatted, extras_total: extrasTotal };
+        const customPrice = cleanerExtrasMap[id];
+        const price = customPrice !== undefined ? customPrice : parseFloat(ex?.price || 0);
+        return ex ? `${ex.name} ($${price.toFixed(2)})` : null;
+      }).filter(Boolean).join(', ');
+
+      // Track pickup date for congestion calculation
+      if (o.pickup_date) {
+        uniquePickupDates.add(o.pickup_date.toISOString().split('T')[0]);
+      }
+
+      return { ...o, total: base + extrasTotal, extras_formatted: extrasFormatted, billed_weight: billedWeight };
     });
 
-    res.json({ orders, grandTotal: orders.reduce((sum, o) => sum + o.total, 0), cleaner, extrasMap, sequenceWarnings });
+    const ordersTotal = orders.reduce((sum, o) => sum + o.total, 0);
+
+    // Calculate congestion surcharge
+    let congestionSurcharge = 0;
+    let congestionDays = 0;
+    if (cleaner && cleaner.congestion_zone) {
+      congestionDays = uniquePickupDates.size;
+      congestionSurcharge = congestionDays * parseFloat(cleaner.congestion_rate || 5);
+    }
+
+    const grandTotal = ordersTotal + congestionSurcharge;
+
+    res.json({ 
+      orders, 
+      ordersTotal,
+      congestionZone: cleaner?.congestion_zone || false,
+      congestionRate: parseFloat(cleaner?.congestion_rate || 5),
+      congestionDays,
+      congestionSurcharge,
+      grandTotal, 
+      sequenceWarnings 
+    });
   } catch (err) {
-    console.error(err);
+    console.error('Invoice report error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
 app.get('/api/reports/invoices-all', authenticate, adminOnly, async (req, res) => {
   const { start_date, end_date } = req.query;
-  if (!start_date || !end_date) return res.status(400).json({ error: 'Missing params' });
-  
+  if (!start_date || !end_date) return res.status(400).json({ error: 'start_date and end_date required' });
+
   try {
     const cleanersResult = await pool.query('SELECT * FROM cleaners ORDER BY name');
     const extrasResult = await pool.query('SELECT * FROM extras');
-    const extrasMap = {}; extrasResult.rows.forEach(e => { extrasMap[e.id] = e; });
+    const extrasMap = {};
+    extrasResult.rows.forEach(e => { extrasMap[e.id] = e; });
+
     const cleanerExtrasResult = await pool.query('SELECT * FROM cleaner_extras');
-    const cleanerCustomPrices = {};
+    const cleanerExtrasMap = {};
     cleanerExtrasResult.rows.forEach(ce => {
-      if (!cleanerCustomPrices[ce.cleaner_id]) cleanerCustomPrices[ce.cleaner_id] = {};
-      cleanerCustomPrices[ce.cleaner_id][ce.extra_id] = parseFloat(ce.custom_price);
+      if (!cleanerExtrasMap[ce.cleaner_id]) cleanerExtrasMap[ce.cleaner_id] = {};
+      cleanerExtrasMap[ce.cleaner_id][ce.extra_id] = parseFloat(ce.custom_price);
     });
+
     const settingsResult = await pool.query('SELECT * FROM settings');
-    const settings = {}; settingsResult.rows.forEach(r => { settings[r.key] = parseFloat(r.value); });
-    
+    const settings = {};
+    settingsResult.rows.forEach(row => { settings[row.key] = parseFloat(row.value); });
+
     const invoices = [];
+
     for (const cleaner of cleanersResult.rows) {
       const ordersResult = await pool.query(
-        `SELECT o.*, c.rate as cleaner_rate, c.min_weight FROM orders o JOIN cleaners c ON o.cleaner_id = c.id
-         WHERE o.cleaner_id = $1 AND o.pickup_date >= $2 AND o.pickup_date <= $3 ORDER BY o.pickup_date, o.order_num`,
+        `SELECT * FROM orders WHERE cleaner_id = $1 AND pickup_date >= $2 AND pickup_date <= $3 ORDER BY pickup_date, order_num`,
         [cleaner.id, start_date, end_date]
       );
+
       if (ordersResult.rows.length === 0) continue;
-      
-      const customPrices = cleanerCustomPrices[cleaner.id] || {};
+
+      const cleanerPrices = cleanerExtrasMap[cleaner.id] || {};
+      const uniquePickupDates = new Set();
+
       const orders = ordersResult.rows.map(o => {
-        const rate = parseFloat(o.cleaner_rate);
-        const weight = parseFloat(o.weight);
-        const minWeight = parseFloat(o.min_weight) || 10;
-        const billableWeight = weight === 0 ? 0 : Math.max(weight, minWeight);
-        const baseTotal = billableWeight * rate * (o.service_type === 'same-day' ? (settings.sameDayMult || 1) : 1);
-        
-        let extrasTotal = 0;
-        const extrasCounts = {};
-        (o.extras || []).forEach(id => {
+        const minWeight = parseFloat(cleaner.min_weight) || 10;
+        const billedWeight = Math.max(parseFloat(o.weight), parseFloat(o.weight) > 0 ? minWeight : 0);
+        const rate = parseFloat(cleaner.rate);
+        const mult = o.service_type === 'same-day' ? settings.sameDayMult : 1;
+        const base = billedWeight * rate * mult;
+
+        const extrasTotal = (o.extras || []).reduce((sum, id) => {
+          const customPrice = cleanerPrices[id];
+          const defaultPrice = extrasMap[id]?.price || 0;
+          return sum + (customPrice !== undefined ? customPrice : parseFloat(defaultPrice));
+        }, 0);
+
+        const extrasFormatted = (o.extras || []).map(id => {
           const ex = extrasMap[id];
-          if (ex) {
-            extrasTotal += customPrices[id] !== undefined ? customPrices[id] : parseFloat(ex.price);
-            extrasCounts[ex.name] = (extrasCounts[ex.name] || 0) + 1;
-          }
-        });
-        return { ...o, total: baseTotal + extrasTotal, extras_formatted: Object.entries(extrasCounts).map(([n, c]) => c > 1 ? `${c}x ${n}` : n).join(', ') };
+          const customPrice = cleanerPrices[id];
+          const price = customPrice !== undefined ? customPrice : parseFloat(ex?.price || 0);
+          return ex ? `${ex.name} ($${price.toFixed(2)})` : null;
+        }).filter(Boolean).join(', ');
+
+        if (o.pickup_date) {
+          uniquePickupDates.add(o.pickup_date.toISOString().split('T')[0]);
+        }
+
+        return { ...o, total: base + extrasTotal, extras_formatted: extrasFormatted };
       });
-      invoices.push({ cleaner, orders, grandTotal: orders.reduce((sum, o) => sum + o.total, 0) });
+
+      const ordersTotal = orders.reduce((sum, o) => sum + o.total, 0);
+
+      // Calculate congestion surcharge
+      let congestionSurcharge = 0;
+      let congestionDays = 0;
+      if (cleaner.congestion_zone) {
+        congestionDays = uniquePickupDates.size;
+        congestionSurcharge = congestionDays * parseFloat(cleaner.congestion_rate || 5);
+      }
+
+      const grandTotal = ordersTotal + congestionSurcharge;
+
+      invoices.push({ 
+        cleaner, 
+        orders, 
+        ordersTotal,
+        congestionZone: cleaner.congestion_zone,
+        congestionRate: parseFloat(cleaner.congestion_rate || 5),
+        congestionDays,
+        congestionSurcharge,
+        grandTotal 
+      });
     }
+
     res.json({ invoices });
   } catch (err) {
-    console.error(err);
+    console.error('All invoices error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-app.get('/api/reports/daily-stats', authenticate, adminOnly, async (req, res) => {
+app.get('/api/reports/daily', authenticate, adminOnly, async (req, res) => {
   const { start_date, end_date } = req.query;
-  if (!start_date || !end_date) return res.status(400).json({ error: 'Missing params' });
-  
   try {
-    const extrasResult = await pool.query('SELECT * FROM extras');
-    const extrasMap = {}; extrasResult.rows.forEach(e => { extrasMap[e.id] = e; });
-    const settingsResult = await pool.query('SELECT * FROM settings');
-    const settings = {}; settingsResult.rows.forEach(r => { settings[r.key] = parseFloat(r.value); });
-    
-    const ordersResult = await pool.query(`
-      SELECT o.*, c.route, c.rate, c.min_weight, c.name as cleaner_name FROM orders o JOIN cleaners c ON o.cleaner_id = c.id
-      WHERE o.pickup_date >= $1 AND o.pickup_date <= $2 ORDER BY o.pickup_date
+    const result = await pool.query(`
+      SELECT pickup_date, c.route, COUNT(*) as order_count, SUM(o.weight) as total_weight
+      FROM orders o JOIN cleaners c ON o.cleaner_id = c.id
+      WHERE o.pickup_date >= $1 AND o.pickup_date <= $2
+      GROUP BY o.pickup_date, c.route ORDER BY o.pickup_date
     `, [start_date, end_date]);
-    
-    let totalOrders = 0, totalWeight = 0, totalAmount = 0;
-    let eastOrders = 0, eastWeight = 0, eastAmount = 0;
-    let westOrders = 0, westWeight = 0, westAmount = 0;
-    let sameDayOrders = 0, sameDayWeight = 0, hour24Orders = 0, hour24Weight = 0;
-    const dailyBreakdown = {};
-    const cleanerBreakdown = {};
-    
-    ordersResult.rows.forEach(o => {
-      const rate = parseFloat(o.rate);
-      const weight = parseFloat(o.weight);
-      const minWeight = parseFloat(o.min_weight) || 10;
-      const billableWeight = weight === 0 ? 0 : Math.max(weight, minWeight);
-      const baseTotal = billableWeight * rate * (o.service_type === 'same-day' ? (settings.sameDayMult || 1) : 1);
-      const extrasTotal = (o.extras || []).reduce((sum, id) => sum + parseFloat(extrasMap[id]?.price || 0), 0);
-      const total = baseTotal + extrasTotal;
-      
-      totalOrders++; totalWeight += weight; totalAmount += total;
-      if (o.route === 'east') { eastOrders++; eastWeight += weight; eastAmount += total; }
-      else { westOrders++; westWeight += weight; westAmount += total; }
-      if (o.service_type === 'same-day') { sameDayOrders++; sameDayWeight += weight; }
-      else { hour24Orders++; hour24Weight += weight; }
-      
-      const dateKey = typeof o.pickup_date === 'string' ? o.pickup_date.split('T')[0] : o.pickup_date.toISOString().split('T')[0];
-      if (!dailyBreakdown[dateKey]) dailyBreakdown[dateKey] = { date: dateKey, orders: 0, weight: 0, amount: 0, eastOrders: 0, eastAmount: 0, westOrders: 0, westAmount: 0 };
-      dailyBreakdown[dateKey].orders++; dailyBreakdown[dateKey].weight += weight; dailyBreakdown[dateKey].amount += total;
-      if (o.route === 'east') { dailyBreakdown[dateKey].eastOrders++; dailyBreakdown[dateKey].eastAmount += total; }
-      else { dailyBreakdown[dateKey].westOrders++; dailyBreakdown[dateKey].westAmount += total; }
-      
-      // Cleaner breakdown
-      const cleanerKey = o.cleaner_id;
-      if (!cleanerBreakdown[cleanerKey]) cleanerBreakdown[cleanerKey] = { name: o.cleaner_name, route: o.route, orders: 0, weight: 0, amount: 0 };
-      cleanerBreakdown[cleanerKey].orders++;
-      cleanerBreakdown[cleanerKey].weight += weight;
-      cleanerBreakdown[cleanerKey].amount += total;
-    });
-    
-    res.json({
-      totals: { total_orders: totalOrders, total_weight: totalWeight, total_amount: totalAmount, east_orders: eastOrders, east_weight: eastWeight, east_amount: eastAmount, west_orders: westOrders, west_weight: westWeight, west_amount: westAmount, same_day_orders: sameDayOrders, same_day_weight: sameDayWeight, twenty_four_hour_orders: hour24Orders, twenty_four_hour_weight: hour24Weight },
-      dailyBreakdown: Object.values(dailyBreakdown).sort((a, b) => a.date.localeCompare(b.date)),
-      cleanerBreakdown: Object.values(cleanerBreakdown).sort((a, b) => b.amount - a.amount)
-    });
+    res.json(result.rows);
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-// Database export endpoint
-app.get('/api/export-database', authenticate, adminOnly, async (req, res) => {
-  try {
-    const [orders, cleaners, extras, cleanerExtras, invoiceTracking, settings] = await Promise.all([
-      pool.query('SELECT o.*, c.name as cleaner_name FROM orders o LEFT JOIN cleaners c ON o.cleaner_id = c.id ORDER BY o.created_at DESC'),
-      pool.query('SELECT * FROM cleaners ORDER BY name'),
-      pool.query('SELECT * FROM extras ORDER BY category, name'),
-      pool.query('SELECT ce.*, c.name as cleaner_name, e.name as extra_name FROM cleaner_extras ce LEFT JOIN cleaners c ON ce.cleaner_id = c.id LEFT JOIN extras e ON ce.extra_id = e.id'),
-      pool.query('SELECT it.*, c.name as cleaner_name FROM invoice_tracking it LEFT JOIN cleaners c ON it.cleaner_id = c.id ORDER BY it.week_start DESC'),
-      pool.query('SELECT * FROM settings')
-    ]);
-    res.json({
-      orders: orders.rows,
-      cleaners: cleaners.rows,
-      extras: extras.rows,
-      cleaner_extras: cleanerExtras.rows,
-      invoice_tracking: invoiceTracking.rows,
-      settings: settings.rows,
-      exported_at: new Date().toISOString()
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Export failed' });
-  }
-});
-
-// ============ INVOICE TRACKING ============
+// Invoice tracking routes
 app.get('/api/invoice-tracking', authenticate, adminOnly, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT it.*, c.name as cleaner_name, c.route 
-      FROM invoice_tracking it 
-      JOIN cleaners c ON it.cleaner_id = c.id 
+      FROM invoice_tracking it JOIN cleaners c ON it.cleaner_id = c.id 
       ORDER BY it.week_start DESC, c.name
     `);
     res.json(result.rows);
@@ -737,17 +654,21 @@ app.get('/api/invoice-tracking', authenticate, adminOnly, async (req, res) => {
   }
 });
 
-app.post('/api/invoice-tracking', authenticate, adminOnly, async (req, res) => {
-  const { cleaner_id, week_start, week_end, invoice_amount } = req.body;
+app.get('/api/invoice-tracking/summary', authenticate, adminOnly, async (req, res) => {
   try {
-    const result = await pool.query(
-      `INSERT INTO invoice_tracking (cleaner_id, week_start, week_end, invoice_amount) 
-       VALUES ($1, $2, $3, $4) 
-       ON CONFLICT (cleaner_id, week_start) DO UPDATE SET invoice_amount = $4
-       RETURNING *`,
-      [cleaner_id, week_start, week_end, invoice_amount]
-    );
-    res.json(result.rows[0]);
+    const result = await pool.query(`
+      SELECT c.name as cleaner_name, c.route,
+        SUM(it.invoice_amount) as total_invoiced,
+        SUM(it.amount_paid) as total_paid,
+        SUM(it.invoice_amount - it.amount_paid) as total_due
+      FROM invoice_tracking it JOIN cleaners c ON it.cleaner_id = c.id
+      GROUP BY c.id, c.name, c.route ORDER BY c.name
+    `);
+    const overall = await pool.query(`
+      SELECT SUM(invoice_amount) as total_invoiced, SUM(amount_paid) as total_paid, SUM(invoice_amount - amount_paid) as total_due
+      FROM invoice_tracking
+    `);
+    res.json({ cleaners: result.rows, overall: overall.rows[0] });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -756,59 +677,65 @@ app.post('/api/invoice-tracking', authenticate, adminOnly, async (req, res) => {
 app.post('/api/invoice-tracking/generate-week', authenticate, adminOnly, async (req, res) => {
   const { week_start, week_end } = req.body;
   try {
-    // Get invoice totals for all cleaners for this week
-    const invoicesResult = await pool.query(`
-      SELECT o.cleaner_id, c.name, c.rate, c.min_weight,
-             SUM(CASE WHEN o.weight = 0 THEN 0 ELSE GREATEST(o.weight, c.min_weight) END * c.rate) as base_total,
-             o.extras
-      FROM orders o
-      JOIN cleaners c ON o.cleaner_id = c.id
-      WHERE o.pickup_date >= $1 AND o.pickup_date <= $2
-      GROUP BY o.cleaner_id, c.name, c.rate, c.min_weight, o.extras
-    `, [week_start, week_end]);
-    
-    // Calculate totals per cleaner including extras
+    const cleaners = await pool.query('SELECT * FROM cleaners');
     const extrasResult = await pool.query('SELECT * FROM extras');
-    const extrasMap = {}; extrasResult.rows.forEach(e => { extrasMap[e.id] = parseFloat(e.price); });
-    
-    const cleanerTotals = {};
-    const ordersResult = await pool.query(`
-      SELECT o.cleaner_id, o.weight, o.extras, o.service_type, c.rate, c.min_weight
-      FROM orders o JOIN cleaners c ON o.cleaner_id = c.id
-      WHERE o.pickup_date >= $1 AND o.pickup_date <= $2
-    `, [week_start, week_end]);
-    
-    const settingsResult = await pool.query('SELECT * FROM settings');
-    const settings = {}; settingsResult.rows.forEach(r => { settings[r.key] = parseFloat(r.value); });
-    
-    ordersResult.rows.forEach(o => {
-      if (!cleanerTotals[o.cleaner_id]) cleanerTotals[o.cleaner_id] = 0;
-      const weight = parseFloat(o.weight);
-      const minWeight = parseFloat(o.min_weight) || 10;
-      const billableWeight = weight === 0 ? 0 : Math.max(weight, minWeight);
-      const mult = o.service_type === 'same-day' ? (settings.sameDayMult || 1) : 1;
-      const baseTotal = billableWeight * parseFloat(o.rate) * mult;
-      const extrasTotal = (o.extras || []).reduce((sum, id) => sum + (extrasMap[id] || 0), 0);
-      cleanerTotals[o.cleaner_id] += baseTotal + extrasTotal;
+    const extrasMap = {};
+    extrasResult.rows.forEach(e => { extrasMap[e.id] = e; });
+
+    const cleanerExtrasResult = await pool.query('SELECT * FROM cleaner_extras');
+    const cleanerExtrasMap = {};
+    cleanerExtrasResult.rows.forEach(ce => {
+      if (!cleanerExtrasMap[ce.cleaner_id]) cleanerExtrasMap[ce.cleaner_id] = {};
+      cleanerExtrasMap[ce.cleaner_id][ce.extra_id] = parseFloat(ce.custom_price);
     });
-    
-    // Insert or update invoice tracking records
-    let created = 0;
-    for (const [cleaner_id, amount] of Object.entries(cleanerTotals)) {
-      if (amount > 0) {
-        await pool.query(
-          `INSERT INTO invoice_tracking (cleaner_id, week_start, week_end, invoice_amount) 
-           VALUES ($1, $2, $3, $4) 
-           ON CONFLICT (cleaner_id, week_start) DO UPDATE SET invoice_amount = $4`,
-          [cleaner_id, week_start, week_end, amount]
-        );
-        created++;
+
+    const settingsResult = await pool.query('SELECT * FROM settings');
+    const settings = {};
+    settingsResult.rows.forEach(row => { settings[row.key] = parseFloat(row.value); });
+
+    let generated = 0;
+    for (const cleaner of cleaners.rows) {
+      const orders = await pool.query(
+        'SELECT * FROM orders WHERE cleaner_id = $1 AND pickup_date >= $2 AND pickup_date <= $3',
+        [cleaner.id, week_start, week_end]
+      );
+      if (orders.rows.length === 0) continue;
+
+      const cleanerPrices = cleanerExtrasMap[cleaner.id] || {};
+      const uniquePickupDates = new Set();
+
+      let total = 0;
+      for (const o of orders.rows) {
+        const minWeight = parseFloat(cleaner.min_weight) || 10;
+        const billedWeight = Math.max(parseFloat(o.weight), parseFloat(o.weight) > 0 ? minWeight : 0);
+        const base = billedWeight * parseFloat(cleaner.rate) * (o.service_type === 'same-day' ? settings.sameDayMult : 1);
+        const extrasTotal = (o.extras || []).reduce((sum, id) => {
+          const customPrice = cleanerPrices[id];
+          return sum + (customPrice !== undefined ? customPrice : parseFloat(extrasMap[id]?.price || 0));
+        }, 0);
+        total += base + extrasTotal;
+        
+        if (o.pickup_date) {
+          uniquePickupDates.add(o.pickup_date.toISOString().split('T')[0]);
+        }
       }
+
+      // Add congestion surcharge
+      if (cleaner.congestion_zone) {
+        const congestionDays = uniquePickupDates.size;
+        total += congestionDays * parseFloat(cleaner.congestion_rate || 5);
+      }
+
+      await pool.query(
+        `INSERT INTO invoice_tracking (cleaner_id, week_start, week_end, invoice_amount) 
+         VALUES ($1, $2, $3, $4) ON CONFLICT (cleaner_id, week_start) DO UPDATE SET invoice_amount = $4`,
+        [cleaner.id, week_start, week_end, total]
+      );
+      generated++;
     }
-    
-    res.json({ success: true, created });
+    res.json({ generated });
   } catch (err) {
-    console.error(err);
+    console.error('Generate week error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -817,10 +744,9 @@ app.put('/api/invoice-tracking/:id', authenticate, adminOnly, async (req, res) =
   const { amount_paid, paid_date, status, notes } = req.body;
   try {
     const result = await pool.query(
-      `UPDATE invoice_tracking SET amount_paid = $1, paid_date = $2, status = $3, notes = $4 WHERE id = $5 RETURNING *`,
-      [amount_paid || 0, paid_date || null, status || 'unpaid', notes || '', req.params.id]
+      'UPDATE invoice_tracking SET amount_paid=$1, paid_date=$2, status=$3, notes=$4 WHERE id=$5 RETURNING *',
+      [amount_paid, paid_date, status, notes, req.params.id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -836,30 +762,48 @@ app.delete('/api/invoice-tracking/:id', authenticate, adminOnly, async (req, res
   }
 });
 
-app.get('/api/invoice-tracking/summary', authenticate, adminOnly, async (req, res) => {
+// Export database
+app.get('/api/export-database', authenticate, adminOnly, async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT c.id as cleaner_id, c.name as cleaner_name, c.route,
-             COALESCE(SUM(it.invoice_amount), 0) as total_invoiced,
-             COALESCE(SUM(it.amount_paid), 0) as total_paid,
-             COALESCE(SUM(it.invoice_amount - it.amount_paid), 0) as total_due
-      FROM cleaners c
-      LEFT JOIN invoice_tracking it ON c.id = it.cleaner_id
-      GROUP BY c.id, c.name, c.route
-      ORDER BY total_due DESC
-    `);
-    const overall = result.rows.reduce((acc, r) => ({
-      total_invoiced: acc.total_invoiced + parseFloat(r.total_invoiced),
-      total_paid: acc.total_paid + parseFloat(r.total_paid),
-      total_due: acc.total_due + parseFloat(r.total_due)
-    }), { total_invoiced: 0, total_paid: 0, total_due: 0 });
-    res.json({ cleaners: result.rows, overall });
+    const [orders, cleaners, extras, cleaner_extras, settings, invoice_tracking] = await Promise.all([
+      pool.query('SELECT * FROM orders ORDER BY pickup_date DESC'),
+      pool.query('SELECT * FROM cleaners ORDER BY name'),
+      pool.query('SELECT * FROM extras ORDER BY name'),
+      pool.query('SELECT * FROM cleaner_extras'),
+      pool.query('SELECT * FROM settings'),
+      pool.query('SELECT * FROM invoice_tracking ORDER BY week_start DESC')
+    ]);
+    res.json({
+      orders: orders.rows,
+      cleaners: cleaners.rows,
+      extras: extras.rows,
+      cleaner_extras: cleaner_extras.rows,
+      settings: settings.rows,
+      invoice_tracking: invoice_tracking.rows
+    });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
 });
 
+// Auto-delete old orders (90 days)
+async function cleanupOldOrders() {
+  try {
+    const result = await pool.query("DELETE FROM orders WHERE pickup_date < CURRENT_DATE - INTERVAL '90 days'");
+    if (result.rowCount > 0) console.log('Cleaned up', result.rowCount, 'old orders');
+  } catch (err) {
+    console.error('Cleanup error:', err);
+  }
+}
+
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
 initDB().then(() => {
-  autoClearOldOrders();
-  app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    cleanupOldOrders();
+    setInterval(cleanupOldOrders, 24 * 60 * 60 * 1000);
+  });
 });
